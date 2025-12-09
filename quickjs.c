@@ -222,6 +222,14 @@ typedef struct JSShape JSShape;
 typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 typedef struct JSObject JSObject;
+typedef struct JSGas {
+    uint64_t limit;
+    uint64_t remaining;
+    uint64_t used;
+    uint32_t schedule_id;
+    uint8_t enabled;
+    uint8_t poisoned;
+} JSGas;
 
 #define JS_VALUE_GET_OBJ(v) ((JSObject *)JS_VALUE_GET_PTR(v))
 #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
@@ -308,6 +316,7 @@ struct JSRuntime {
     int shape_hash_count; /* number of hashed shapes */
     JSShape **shape_hash;
     void *user_opaque;
+    BOOL deterministic_gc;
 };
 
 struct JSClass {
@@ -475,6 +484,13 @@ struct JSContext {
     JSValue global_var_obj; /* contains the global let/const definitions */
 
     uint64_t random_state;
+    JSGas gas;
+    const uint16_t *gas_costs;
+    uint32_t gas_costs_len;
+    uint32_t deterministic_profile_id;
+    BOOL deterministic_mode;
+    BOOL deterministic_random_seeded;
+    BOOL deterministic_intrinsics;
 
     /* when the counter reaches zero, JSRutime.interrupt_handler is called */
     int interrupt_counter;
@@ -509,6 +525,47 @@ typedef enum {
     JS_ATOM_KIND_SYMBOL,
     JS_ATOM_KIND_PRIVATE,
 } JSAtomKindEnum;
+
+#define JS_GAS_OOG_MESSAGE "out of gas"
+
+static inline int js_gas_charge(JSContext *ctx, uint32_t cost)
+{
+    JSGas *gas = &ctx->gas;
+    if (!gas->enabled)
+        return 0;
+    if (unlikely(gas->poisoned)) {
+        return -1;
+    }
+    if (gas->remaining < cost) {
+        gas->used += gas->remaining;
+        gas->remaining = 0;
+        gas->poisoned = 1;
+        JS_ThrowInternalError(ctx, JS_GAS_OOG_MESSAGE);
+        return -1;
+    }
+    gas->remaining -= cost;
+    gas->used += cost;
+    return 0;
+}
+
+static inline int js_gas_charge_alloc(JSContext *ctx, size_t size)
+{
+    uint32_t cost;
+
+    if (!ctx->gas.enabled)
+        return 0;
+    if (ctx->gas.poisoned)
+        return 0;
+    if (size == 0)
+        return 0;
+    cost = (size > UINT32_MAX) ? UINT32_MAX : (uint32_t)size;
+    return js_gas_charge(ctx, cost);
+}
+
+static inline uint32_t js_opcode_gas(JSContext *ctx, uint32_t opcode);
+static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                 const char *input, size_t input_len,
+                                 const char *filename, int flags, int scope_idx);
 
 #define JS_ATOM_HASH_MASK  ((1 << 30) - 1)
 #define JS_ATOM_HASH_PRIVATE JS_ATOM_HASH_MASK
@@ -1354,6 +1411,8 @@ static JSClassID js_class_id_alloc = JS_CLASS_INIT_COUNT;
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     BOOL force_gc;
+    if (rt->deterministic_gc)
+        return;
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = TRUE;
 #else
@@ -1409,6 +1468,8 @@ void *js_mallocz_rt(JSRuntime *rt, size_t size)
 void *js_malloc(JSContext *ctx, size_t size)
 {
     void *ptr;
+    if (unlikely(js_gas_charge_alloc(ctx, size)))
+        return NULL;
     ptr = js_malloc_rt(ctx->rt, size);
     if (unlikely(!ptr)) {
         JS_ThrowOutOfMemory(ctx);
@@ -1421,6 +1482,8 @@ void *js_malloc(JSContext *ctx, size_t size)
 void *js_mallocz(JSContext *ctx, size_t size)
 {
     void *ptr;
+    if (unlikely(js_gas_charge_alloc(ctx, size)))
+        return NULL;
     ptr = js_mallocz_rt(ctx->rt, size);
     if (unlikely(!ptr)) {
         JS_ThrowOutOfMemory(ctx);
@@ -1438,6 +1501,8 @@ void js_free(JSContext *ctx, void *ptr)
 void *js_realloc(JSContext *ctx, void *ptr, size_t size)
 {
     void *ret;
+    if (unlikely(js_gas_charge_alloc(ctx, size)))
+        return NULL;
     ret = js_realloc_rt(ctx->rt, ptr, size);
     if (unlikely(!ret && size != 0)) {
         JS_ThrowOutOfMemory(ctx);
@@ -1450,6 +1515,8 @@ void *js_realloc(JSContext *ctx, void *ptr, size_t size)
 void *js_realloc2(JSContext *ctx, void *ptr, size_t size, size_t *pslack)
 {
     void *ret;
+    if (unlikely(js_gas_charge_alloc(ctx, size)))
+        return NULL;
     ret = js_realloc_rt(ctx->rt, ptr, size);
     if (unlikely(!ret && size != 0)) {
         JS_ThrowOutOfMemory(ctx);
@@ -2188,6 +2255,18 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->regexp_ctor = JS_NULL;
     ctx->promise_ctor = JS_NULL;
     init_list_head(&ctx->loaded_modules);
+    ctx->gas.limit = 0;
+    ctx->gas.remaining = 0;
+    ctx->gas.used = 0;
+    ctx->gas.schedule_id = 0;
+    ctx->gas.enabled = 0;
+    ctx->gas.poisoned = 0;
+    ctx->gas_costs = NULL;
+    ctx->gas_costs_len = 0;
+    ctx->deterministic_mode = FALSE;
+    ctx->deterministic_random_seeded = FALSE;
+    ctx->deterministic_profile_id = 0;
+    ctx->deterministic_intrinsics = FALSE;
 
     if (JS_AddIntrinsicBasicObjects(ctx)) {
         JS_FreeContext(ctx);
@@ -2221,6 +2300,63 @@ JSContext *JS_NewContext(JSRuntime *rt)
     return ctx;
 }
 
+void JS_SetDeterministicMode(JSContext *ctx, int enabled)
+{
+    ctx->deterministic_mode = enabled;
+    ctx->rt->deterministic_gc = enabled;
+    if (enabled)
+        ctx->deterministic_random_seeded = TRUE;
+    if (enabled && ctx->random_state == 0) {
+        ctx->random_state = 1;
+    }
+}
+
+void JS_SetDeterministicProfileId(JSContext *ctx, uint32_t profile_id)
+{
+    ctx->deterministic_profile_id = profile_id;
+}
+
+void JS_SetDeterministicRandomSeed(JSContext *ctx, uint64_t seed)
+{
+    ctx->random_state = seed ? seed : 1;
+    ctx->deterministic_random_seeded = TRUE;
+}
+
+int JS_AddIntrinsicDeterministic(JSContext *ctx)
+{
+    if (ctx->deterministic_intrinsics)
+        return 0;
+    /* Install base intrinsics first, then lock down features. */
+    if (!ctx->deterministic_random_seeded)
+        JS_SetDeterministicRandomSeed(ctx, 1);
+    JS_SetDeterministicMode(ctx, FALSE);
+    ctx->eval_internal = __JS_EvalInternal;
+    ctx->compile_regexp = NULL;
+    if (JS_AddIntrinsicBaseObjects(ctx))
+        return -1;
+    JS_SetDeterministicMode(ctx, TRUE);
+    ctx->eval_internal = __JS_EvalInternal;
+    ctx->deterministic_intrinsics = TRUE;
+    return 0;
+}
+
+JSContext *JS_NewDeterministicContext(JSRuntime *rt)
+{
+    JSContext *ctx;
+
+    ctx = JS_NewContextRaw(rt);
+    if (!ctx)
+        return NULL;
+
+    JS_SetDeterministicMode(ctx, TRUE);
+    JS_SetDeterministicProfileId(ctx, 1);
+    if (JS_AddIntrinsicDeterministic(ctx)) {
+        JS_FreeContext(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
 void *JS_GetContextOpaque(JSContext *ctx)
 {
     return ctx->user_opaque;
@@ -2229,6 +2365,41 @@ void *JS_GetContextOpaque(JSContext *ctx)
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
     ctx->user_opaque = opaque;
+}
+
+void JS_SetGasLimit(JSContext *ctx, uint64_t limit)
+{
+    ctx->gas.limit = limit;
+    ctx->gas.remaining = limit;
+    ctx->gas.used = 0;
+    ctx->gas.poisoned = 0;
+    ctx->gas.enabled = (limit != 0);
+}
+
+void JS_ResetGas(JSContext *ctx)
+{
+    ctx->gas.remaining = ctx->gas.limit;
+    ctx->gas.used = 0;
+    ctx->gas.poisoned = 0;
+    ctx->gas.enabled = (ctx->gas.limit != 0);
+}
+
+uint64_t JS_GetGasUsed(JSContext *ctx)
+{
+    return ctx->gas.used;
+}
+
+uint64_t JS_GetGasRemaining(JSContext *ctx)
+{
+    return ctx->gas.remaining;
+}
+
+void JS_SetGasSchedule(JSContext *ctx, uint32_t schedule_id,
+                       const uint16_t *cost_table, size_t table_len)
+{
+    ctx->gas.schedule_id = schedule_id;
+    ctx->gas_costs = cost_table;
+    ctx->gas_costs_len = cost_table ? table_len : 0;
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -16691,7 +16862,10 @@ static JSVarRef *js_global_object_get_uninitialized_var(JSContext *ctx, JSObject
     
     prs = find_own_property(&pr, p, atom);
     if (prs) {
-        assert((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF);
+        if (unlikely((prs->flags & JS_PROP_TMASK) != JS_PROP_VARREF)) {
+            JS_ThrowInternalError(ctx, "unexpected global uninitialized var slot");
+            return NULL;
+        }
         var_ref = pr->u.var_ref;
         var_ref->header.ref_count++;
         return var_ref;
@@ -17372,7 +17546,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define SWITCH(pc)      switch (opcode = *pc++)
 #define CASE(op)        case op
 #define DEFAULT         default
-#define BREAK           break
+#define BREAK           goto dispatch_start
 #else
     static const void * const dispatch_table[256] = {
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
@@ -17384,10 +17558,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      goto *dispatch_table[opcode = *pc++];
+#define SWITCH(pc)      goto *dispatch_table[opcode];
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
-#define BREAK           SWITCH(pc)
+#define BREAK           goto dispatch_start
 #endif
 
     if (js_poll_interrupts(caller_ctx))
@@ -17480,6 +17654,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     for(;;) {
         int call_argc;
         JSValue *call_argv;
+
+    dispatch_start:
+        opcode = *pc++;
+        if (unlikely(js_gas_charge(ctx, js_opcode_gas(ctx, opcode))))
+            goto out_of_gas;
 
         SWITCH(pc) {
         CASE(OP_push_i32):
@@ -20063,6 +20242,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             goto exception;
         }
     }
+ out_of_gas:
+    ret_val = JS_EXCEPTION;
  exception:
     if (is_backtrace_needed(ctx, rt->current_exception)) {
         /* add the backtrace information now (it is not done
@@ -21574,6 +21755,19 @@ static const JSOpCode opcode_info[OP_COUNT + (OP_TEMP_END - OP_TEMP_START)] = {
 #undef FMT
 };
 
+static const uint16_t js_default_gas_costs[OP_COUNT] = {
+    [0 ... OP_COUNT - 1] = 1,
+};
+
+static inline uint32_t js_opcode_gas(JSContext *ctx, uint32_t opcode)
+{
+    const uint16_t *costs = ctx->gas_costs ? ctx->gas_costs : js_default_gas_costs;
+    uint32_t len = ctx->gas_costs_len ? ctx->gas_costs_len : OP_COUNT;
+    if (opcode >= len)
+        return 1;
+    return costs[opcode];
+}
+
 #if SHORT_OPCODES
 /* After the final compilation pass, short opcodes are used. Their
    opcodes overlap with the temporary opcodes which cannot appear in
@@ -22010,6 +22204,8 @@ static __exception int js_parse_regexp(JSParseState *s)
     uint32_t c;
     JSValue body_str, flags_str;
 
+    if (unlikely(s->ctx->deterministic_mode))
+        return js_parse_error(s, "regular expressions are disabled in deterministic mode");
     p = s->buf_ptr;
     p++;
     in_class = FALSE;
@@ -22661,6 +22857,11 @@ static __exception int next_token(JSParseState *s)
     }
     s->buf_ptr = p;
 
+    if (unlikely(s->ctx->deterministic_mode)) {
+        if (s->token.val == TOK_AWAIT || s->token.val == TOK_IMPORT) {
+            return js_parse_error(s, "token is disabled in deterministic mode");
+        }
+    }
     //    dump_token(s, &s->token);
     return 0;
 
@@ -35948,6 +36149,11 @@ static __exception int js_parse_function_decl2(JSParseState *s,
         func_name = JS_DupAtom(ctx, func_name);
     }
 
+    if (ctx->deterministic_mode &&
+        (func_kind & (JS_FUNC_ASYNC | JS_FUNC_GENERATOR))) {
+        return js_parse_error(s, "async and generator functions are disabled in deterministic mode");
+    }
+
     if (fd->is_eval && fd->eval_type == JS_EVAL_TYPE_MODULE &&
         (func_type == JS_PARSE_FUNC_STATEMENT || func_type == JS_PARSE_FUNC_VAR)) {
         JSGlobalVar *hf;
@@ -36693,6 +36899,10 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     int saved_js_mode = 0;
     JSValue ret;
     
+    if (unlikely(ctx->deterministic_mode) &&
+        ((flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_DIRECT)) {
+        return JS_ThrowTypeError(ctx, "direct eval is disabled in deterministic mode");
+    }
     if (unlikely(!ctx->eval_internal)) {
         return JS_ThrowTypeError(ctx, "eval is not supported");
     }
@@ -40440,6 +40650,8 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
     JSValue s, proto, obj = JS_UNDEFINED;
     StringBuffer b_s, *b = &b_s;
 
+    if (ctx->deterministic_mode && ctx->rt->current_stack_frame)
+        return JS_ThrowTypeError(ctx, "Function constructor is disabled in deterministic mode");
     string_buffer_init(ctx, b, 0);
     string_buffer_putc8(b, '(');
 
@@ -41470,6 +41682,9 @@ exception:
     return JS_EXCEPTION;
 }
 
+#define GAS_ARRAY_ITER_BASE 5
+#define GAS_ARRAY_ITER_ELEM 1
+
 #define special_every    0
 #define special_some     1
 #define special_forEach  2
@@ -41490,8 +41705,11 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
     int64_t len, k, n;
     int present;
 
+    obj = JS_UNDEFINED;
     ret = JS_UNDEFINED;
     val = JS_UNDEFINED;
+    if (js_gas_charge(ctx, GAS_ARRAY_ITER_BASE))
+        goto exception;
     if (special & special_TA) {
         obj = JS_DupValue(ctx, this_val);
         len = js_typed_array_get_length_unsafe(ctx, obj);
@@ -41546,6 +41764,8 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
     n = 0;
 
     for(k = 0; k < len; k++) {
+        if (unlikely(js_gas_charge(ctx, GAS_ARRAY_ITER_ELEM)))
+            goto exception;
         if (special & special_TA) {
             val = JS_GetPropertyInt64(ctx, obj, k);
             if (JS_IsException(val))
@@ -41649,6 +41869,9 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
 
     acc = JS_UNDEFINED;
     val = JS_UNDEFINED;
+    obj = JS_UNDEFINED;
+    if (js_gas_charge(ctx, GAS_ARRAY_ITER_BASE))
+        goto exception;
     if (special & special_TA) {
         obj = JS_DupValue(ctx, this_val);
         len = js_typed_array_get_length_unsafe(ctx, obj);
@@ -41669,6 +41892,8 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
         acc = JS_DupValue(ctx, argv[1]);
     } else {
         for(;;) {
+            if (unlikely(js_gas_charge(ctx, GAS_ARRAY_ITER_ELEM)))
+                goto exception;
             if (k >= len) {
                 JS_ThrowTypeError(ctx, "empty array");
                 goto exception;
@@ -41690,6 +41915,8 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
         }
     }
     for (; k < len; k++) {
+        if (unlikely(js_gas_charge(ctx, GAS_ARRAY_ITER_ELEM)))
+            goto exception;
         k1 = (special & special_reduceRight) ? len - k - 1 : k;
         if (special & special_TA) {
             val = JS_GetPropertyInt64(ctx, obj, k1);
@@ -43608,6 +43835,8 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
     acc = JS_UNDEFINED;
     func = JS_UNDEFINED;
     method = JS_UNDEFINED;
+    if (js_gas_charge(ctx, GAS_ARRAY_ITER_BASE))
+        goto exception;
     if (check_function(ctx, argv[0]))
         goto exception;
     func = JS_DupValue(ctx, argv[0]);
@@ -43628,6 +43857,8 @@ static JSValue js_iterator_proto_reduce(JSContext *ctx, JSValueConst this_val,
         idx = 1;
     }
     for (/* empty */; /*empty*/; idx++) {
+        if (unlikely(js_gas_charge(ctx, GAS_ARRAY_ITER_ELEM)))
+            goto exception;
         item = JS_IteratorNext(ctx, this_val, method, 0, NULL, &done);
         if (JS_IsException(item))
             goto exception_no_close;
@@ -46669,6 +46900,12 @@ static uint64_t xorshift64star(uint64_t *pstate)
 static void js_random_init(JSContext *ctx)
 {
     struct timeval tv;
+
+    if (ctx->deterministic_mode || ctx->deterministic_random_seeded) {
+        if (ctx->random_state == 0)
+            ctx->random_state = 1;
+        return;
+    }
     gettimeofday(&tv, NULL);
     ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
     /* the state must be non zero */

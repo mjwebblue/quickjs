@@ -50,6 +50,7 @@ extern "C" {
 typedef struct JSRuntime JSRuntime;
 typedef struct JSContext JSContext;
 typedef struct JSClass JSClass;
+typedef struct JSGas JSGas;
 typedef uint32_t JSClassID;
 typedef uint32_t JSAtom;
 
@@ -383,10 +384,15 @@ void JS_RunGC(JSRuntime *rt);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);
+JSContext *JS_NewDeterministicContext(JSRuntime *rt);
 void JS_FreeContext(JSContext *s);
 JSContext *JS_DupContext(JSContext *ctx);
 void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+int JS_AddIntrinsicDeterministic(JSContext *ctx);
+void JS_SetDeterministicMode(JSContext *ctx, int enabled);
+void JS_SetDeterministicProfileId(JSContext *ctx, uint32_t profile_id);
+void JS_SetDeterministicRandomSeed(JSContext *ctx, uint64_t seed);
 JSRuntime *JS_GetRuntime(JSContext *ctx);
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
@@ -409,6 +415,12 @@ int JS_AddIntrinsicWeakRef(JSContext *ctx);
 
 JSValue js_string_codePointRange(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv);
+void JS_SetGasLimit(JSContext *ctx, uint64_t limit);
+void JS_ResetGas(JSContext *ctx);
+uint64_t JS_GetGasUsed(JSContext *ctx);
+uint64_t JS_GetGasRemaining(JSContext *ctx);
+void JS_SetGasSchedule(JSContext *ctx, uint32_t schedule_id,
+                       const uint16_t *cost_table, size_t table_len);
 
 void *js_malloc_rt(JSRuntime *rt, size_t size);
 void js_free_rt(JSRuntime *rt, void *ptr);

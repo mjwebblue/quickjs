@@ -8,6 +8,7 @@ examples/hello
 examples/hello_module
 examples/hello.exe
 examples/test_fib.exe
+examples/deterministic_demo
 hello.c
 microbench*.txt
 qjs

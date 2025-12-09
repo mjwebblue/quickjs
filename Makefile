@@ -231,6 +231,7 @@ PROGS+=examples/hello examples/test_fib
 ifndef CONFIG_M32
 ifndef CONFIG_WIN32
 PROGS+=examples/hello_module
+PROGS+=examples/deterministic_demo
 endif
 endif
 ifdef CONFIG_SHARED_LIBS
@@ -330,7 +331,7 @@ run-test262-debug: $(patsubst %.o, %.debug.o, $(OBJDIR)/run-test262.o $(QJS_LIB_
 # object suffix order: nolto
 
 $(OBJDIR)/%.o: %.c | $(OBJDIR)
-	$(CC) $(CFLAGS_OPT) -c -o $@ $<
+	$(CC) $(CFLAGS_OPT) -I. -c -o $@ $<
 
 $(OBJDIR)/fuzz_%.o: fuzz/fuzz_%.c | $(OBJDIR)
 	$(CC) $(CFLAGS_OPT) -c -I. -o $@ $<
@@ -416,6 +417,9 @@ examples/fib.so: $(OBJDIR)/examples/fib.pic.o
 
 examples/point.so: $(OBJDIR)/examples/point.pic.o
 	$(CC) $(LDFLAGS) -shared -o $@ $^
+
+examples/deterministic_demo: $(OBJDIR)/examples/deterministic_demo.o $(QJS_LIB_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 ###############################################################################
 # documentation
