@@ -343,9 +343,15 @@ static inline JSValue __JS_NewShortBigInt(JSContext *ctx, int64_t d)
    promise. Only allowed with JS_EVAL_TYPE_GLOBAL */
 #define JS_EVAL_FLAG_ASYNC (1 << 7)
 
+#define JS_DETERMINISTIC_MAX_MANIFEST_BYTES 1048576
+#define JS_DETERMINISTIC_MAX_CONTEXT_BLOB_BYTES 1048576
+
 typedef JSValue JSCFunction(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic);
 typedef JSValue JSCFunctionData(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *func_data);
+
+#define JS_GAS_VERSION_LATEST 1
+#define JS_GAS_UNLIMITED UINT64_C(0xffffffffffffffff)
 
 typedef struct JSMallocState {
     size_t malloc_count;
@@ -380,13 +386,88 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
+int JS_RunGCCheckpoint(JSContext *ctx);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JSContext *JS_NewContext(JSRuntime *rt);
+int JS_NewDeterministicRuntime(JSRuntime **out_rt, JSContext **out_ctx);
+typedef struct JSDeterministicInitOptions {
+    const uint8_t *manifest_bytes;
+    size_t manifest_size;
+    const char *manifest_hash_hex;
+    const uint8_t *context_blob;
+    size_t context_blob_size;
+    uint64_t gas_limit;
+} JSDeterministicInitOptions;
+int JS_InitDeterministicContext(JSContext *ctx, const JSDeterministicInitOptions *options);
 void JS_FreeContext(JSContext *s);
 JSContext *JS_DupContext(JSContext *ctx);
 void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+void JS_SetGasLimit(JSContext *ctx, uint64_t gas_limit);
+uint64_t JS_GetGasRemaining(JSContext *ctx);
+uint64_t JS_GetGasLimit(JSContext *ctx);
+uint32_t JS_GetGasVersion(JSContext *ctx);
+typedef struct JSGasTrace {
+    uint64_t opcode_count;
+    uint64_t opcode_gas;
+    uint64_t builtin_array_cb_base_count;
+    uint64_t builtin_array_cb_base_gas;
+    uint64_t builtin_array_cb_per_element_count;
+    uint64_t builtin_array_cb_per_element_gas;
+    uint64_t allocation_count;
+    uint64_t allocation_bytes;
+    uint64_t allocation_gas;
+} JSGasTrace;
+int JS_EnableGasTrace(JSContext *ctx, int enabled);
+int JS_ResetGasTrace(JSContext *ctx);
+int JS_ReadGasTrace(JSContext *ctx, JSGasTrace *out_trace);
+int JS_UseGas(JSContext *ctx, uint64_t amount);
+
+#define JS_HOST_CALL_TRANSPORT_ERROR UINT32_C(0xffffffff)
+
+typedef struct JSHostCallResult {
+    uint8_t *data;
+    uint32_t length;
+} JSHostCallResult;
+/* data points to an internal scratch buffer owned by the context; valid until the next JS_HostCall or context free */
+
+typedef uint32_t JSHostCallFunc(JSContext *ctx,
+                                uint32_t fn_id,
+                                const uint8_t *req_ptr,
+                                uint32_t req_len,
+                                uint8_t *resp_ptr,
+                                uint32_t resp_capacity,
+                                void *opaque);
+
+int JS_SetHostCallDispatcher(JSRuntime *rt, JSHostCallFunc *func, void *opaque);
+int JS_HostCall(JSContext *ctx,
+                uint32_t fn_id,
+                const uint8_t *req_bytes,
+                size_t req_len,
+                uint32_t max_request_bytes,
+                uint32_t max_response_bytes,
+                JSHostCallResult *out_result);
+
+typedef struct JSDvLimits {
+    uint32_t max_depth;
+    uint32_t max_encoded_bytes;
+    uint32_t max_string_bytes;
+    uint32_t max_array_length;
+    uint32_t max_map_length;
+} JSDvLimits;
+
+typedef struct JSDvBuffer {
+    uint8_t *data;
+    size_t length;
+} JSDvBuffer;
+
+extern const JSDvLimits JS_DV_LIMIT_DEFAULTS;
+
+int JS_EncodeDV(JSContext *ctx, JSValueConst value, const JSDvLimits *limits, JSDvBuffer *out_buffer);
+JSValue JS_DecodeDV(JSContext *ctx, const uint8_t *data, size_t length, const JSDvLimits *limits);
+void JS_FreeDVBuffer(JSContext *ctx, JSDvBuffer *buffer);
+
 JSRuntime *JS_GetRuntime(JSContext *ctx);
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);

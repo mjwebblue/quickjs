@@ -42,7 +42,9 @@
 
 #include "cutils.h"
 #include "list.h"
+#include "quickjs-internal.h"
 #include "quickjs.h"
+#include "quickjs-host.h"
 #include "libregexp.h"
 #include "libunicode.h"
 #include "dtoa.h"
@@ -234,6 +236,7 @@ typedef enum {
 } JSGCPhaseEnum;
 
 typedef enum OPCodeEnum OPCodeEnum;
+typedef struct JSGasTraceData JSGasTraceData;
 
 struct JSRuntime {
     JSMallocFunctions mf;
@@ -260,6 +263,9 @@ struct JSRuntime {
     struct list_head tmp_obj_list; /* used during GC */
     JSGCPhaseEnum gc_phase : 8;
     size_t malloc_gc_threshold;
+    BOOL deterministic_mode : 8;
+    BOOL det_gc_pending : 8;
+    uint64_t det_gc_alloc_bytes;
     struct list_head weakref_list; /* list of JSWeakRefHeader.link */
 #ifdef DUMP_LEAKS
     struct list_head string_list; /* list of JSString.link */
@@ -274,6 +280,10 @@ struct JSRuntime {
     BOOL current_exception_is_uncatchable : 8;
     /* true if inside an out of memory error, to avoid recursing */
     BOOL in_out_of_memory : 8;
+    /* true if inside out-of-gas handling to avoid recursion */
+    BOOL in_out_of_gas : 8;
+    /* true if inside a host_call to prevent reentrancy */
+    BOOL in_host_call : 8;
 
     struct JSStackFrame *current_stack_frame;
 
@@ -282,6 +292,8 @@ struct JSRuntime {
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
+    JSHostCallFunc *host_call_func;
+    void *host_call_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
 
@@ -489,6 +501,23 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int flags, int scope_idx);
     void *user_opaque;
+
+    uint64_t gas_limit;
+    uint64_t gas_remaining;
+    uint32_t gas_version;
+
+    uint8_t *abi_manifest_bytes;
+    size_t abi_manifest_size;
+    uint8_t abi_manifest_hash[32];
+    char abi_manifest_hash_hex[65];
+    uint8_t *deterministic_context_blob;
+    size_t deterministic_context_blob_size;
+
+    uint8_t *host_call_resp_buf;
+    uint32_t host_call_resp_capacity;
+
+    JSGasTraceData *gas_trace;
+    BOOL deterministic_mode;
 };
 
 typedef union JSFloat64Union {
@@ -1085,6 +1114,94 @@ enum OPCodeEnum {
     OP_TEMP_END,
 };
 
+static const uint16_t js_opcode_gas_cost[OP_COUNT] = {
+#define FMT(f)
+#define DEF(id, size, n_pop, n_push, f) [OP_ ## id] = 1,
+#define def(id, size, n_pop, n_push, f)
+#include "quickjs-opcode.h"
+#undef def
+#undef DEF
+#undef FMT
+};
+
+static inline uint16_t js_get_opcode_gas_cost(uint8_t opcode)
+{
+    if (opcode < OP_COUNT)
+        return js_opcode_gas_cost[opcode];
+    return 0;
+}
+
+struct JSGasTraceData {
+    BOOL enabled;
+    uint64_t opcode_count_total;
+    uint64_t opcode_gas;
+    uint64_t builtin_array_cb_base_count;
+    uint64_t builtin_array_cb_base_gas;
+    uint64_t builtin_array_cb_per_element_count;
+    uint64_t builtin_array_cb_per_element_gas;
+    uint64_t allocation_count;
+    uint64_t allocation_bytes;
+    uint64_t allocation_gas;
+};
+
+static void js_gas_trace_reset_counts(JSGasTraceData *trace)
+{
+    BOOL enabled = trace->enabled;
+    memset(trace, 0, sizeof(*trace));
+    trace->enabled = enabled;
+}
+
+static JSGasTraceData *js_gas_trace_or_null(JSContext *ctx)
+{
+    if (!ctx || !ctx->gas_trace || !ctx->gas_trace->enabled)
+        return NULL;
+    return ctx->gas_trace;
+}
+
+static JSGasTraceData *js_gas_trace_ensure(JSContext *ctx)
+{
+    if (!ctx->gas_trace) {
+        ctx->gas_trace = js_mallocz_rt(ctx->rt, sizeof(JSGasTraceData));
+    }
+    return ctx->gas_trace;
+}
+
+static void js_gas_trace_record_opcode(JSContext *ctx, uint8_t opcode, uint16_t gas_cost)
+{
+    JSGasTraceData *trace = js_gas_trace_or_null(ctx);
+    if (!trace)
+        return;
+
+    trace->opcode_count_total++;
+    trace->opcode_gas += gas_cost;
+}
+
+static void js_gas_trace_record_array_cb(JSContext *ctx, uint16_t gas_cost, BOOL per_element)
+{
+    JSGasTraceData *trace = js_gas_trace_or_null(ctx);
+    if (!trace)
+        return;
+
+    if (per_element) {
+        trace->builtin_array_cb_per_element_count++;
+        trace->builtin_array_cb_per_element_gas += gas_cost;
+    } else {
+        trace->builtin_array_cb_base_count++;
+        trace->builtin_array_cb_base_gas += gas_cost;
+    }
+}
+
+static void js_gas_trace_record_allocation(JSContext *ctx, size_t size, uint64_t gas_cost)
+{
+    JSGasTraceData *trace = js_gas_trace_or_null(ctx);
+    if (!trace)
+        return;
+
+    trace->allocation_count++;
+    trace->allocation_bytes += size;
+    trace->allocation_gas += gas_cost;
+}
+
 static int JS_InitAtoms(JSRuntime *rt);
 static JSAtom __JS_NewAtomInit(JSRuntime *rt, const char *str, int len,
                                int atom_type);
@@ -1354,6 +1471,9 @@ static JSClassID js_class_id_alloc = JS_CLASS_INIT_COUNT;
 static void js_trigger_gc(JSRuntime *rt, size_t size)
 {
     BOOL force_gc;
+
+    if (rt->deterministic_mode)
+        return;
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = TRUE;
 #else
@@ -1369,6 +1489,50 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
         rt->malloc_gc_threshold = rt->malloc_state.malloc_size +
             (rt->malloc_state.malloc_size >> 1);
     }
+}
+
+#define JS_GAS_ALLOC_BASE 3
+#define JS_GAS_ALLOC_PER_BYTE_SHIFT 4
+#define JS_DET_GC_THRESHOLD_BYTES (512 * 1024)
+
+static uint64_t js_gas_allocation_cost(size_t size)
+{
+    const uint64_t unit = UINT64_C(1) << JS_GAS_ALLOC_PER_BYTE_SHIFT;
+    uint64_t units;
+
+    if (size == 0) {
+        units = 0;
+    } else if (size > UINT64_MAX - (unit - 1)) {
+        units = UINT64_MAX;
+    } else {
+        units = ((uint64_t)size + (unit - 1)) >> JS_GAS_ALLOC_PER_BYTE_SHIFT;
+    }
+
+    if (units > UINT64_MAX - JS_GAS_ALLOC_BASE)
+        return UINT64_MAX;
+    return JS_GAS_ALLOC_BASE + units;
+}
+
+static int js_charge_gas_allocation_ctx(JSContext *ctx, size_t size)
+{
+    JSRuntime *rt = ctx->rt;
+    uint64_t gas_cost;
+
+    if (rt->in_out_of_gas || rt->current_exception_is_uncatchable)
+        return 0;
+
+    if (rt->deterministic_mode) {
+        rt->det_gc_alloc_bytes += size;
+        if (rt->det_gc_alloc_bytes >= JS_DET_GC_THRESHOLD_BYTES)
+            rt->det_gc_pending = TRUE;
+    }
+
+    gas_cost = js_gas_allocation_cost(size);
+    if (JS_UseGas(ctx, gas_cost))
+        return -1;
+
+    js_gas_trace_record_allocation(ctx, size, gas_cost);
+    return 0;
 }
 
 static size_t js_malloc_usable_size_unknown(const void *ptr)
@@ -1409,9 +1573,12 @@ void *js_mallocz_rt(JSRuntime *rt, size_t size)
 void *js_malloc(JSContext *ctx, size_t size)
 {
     void *ptr;
+    if (size != 0 && js_charge_gas_allocation_ctx(ctx, size))
+        return NULL;
     ptr = js_malloc_rt(ctx->rt, size);
     if (unlikely(!ptr)) {
-        JS_ThrowOutOfMemory(ctx);
+        if (JS_IsUninitialized(ctx->rt->current_exception))
+            JS_ThrowOutOfMemory(ctx);
         return NULL;
     }
     return ptr;
@@ -1421,9 +1588,12 @@ void *js_malloc(JSContext *ctx, size_t size)
 void *js_mallocz(JSContext *ctx, size_t size)
 {
     void *ptr;
+    if (size != 0 && js_charge_gas_allocation_ctx(ctx, size))
+        return NULL;
     ptr = js_mallocz_rt(ctx->rt, size);
     if (unlikely(!ptr)) {
-        JS_ThrowOutOfMemory(ctx);
+        if (JS_IsUninitialized(ctx->rt->current_exception))
+            JS_ThrowOutOfMemory(ctx);
         return NULL;
     }
     return ptr;
@@ -1438,9 +1608,12 @@ void js_free(JSContext *ctx, void *ptr)
 void *js_realloc(JSContext *ctx, void *ptr, size_t size)
 {
     void *ret;
+    if (size != 0 && js_charge_gas_allocation_ctx(ctx, size))
+        return NULL;
     ret = js_realloc_rt(ctx->rt, ptr, size);
     if (unlikely(!ret && size != 0)) {
-        JS_ThrowOutOfMemory(ctx);
+        if (JS_IsUninitialized(ctx->rt->current_exception))
+            JS_ThrowOutOfMemory(ctx);
         return NULL;
     }
     return ret;
@@ -1450,9 +1623,12 @@ void *js_realloc(JSContext *ctx, void *ptr, size_t size)
 void *js_realloc2(JSContext *ctx, void *ptr, size_t size, size_t *pslack)
 {
     void *ret;
+    if (size != 0 && js_charge_gas_allocation_ctx(ctx, size))
+        return NULL;
     ret = js_realloc_rt(ctx->rt, ptr, size);
     if (unlikely(!ret && size != 0)) {
-        JS_ThrowOutOfMemory(ctx);
+        if (JS_IsUninitialized(ctx->rt->current_exception))
+            JS_ThrowOutOfMemory(ctx);
         return NULL;
     }
     if (pslack) {
@@ -1697,6 +1873,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     JS_UpdateStackTop(rt);
 
     rt->current_exception = JS_UNINITIALIZED;
+    rt->in_out_of_gas = FALSE;
 
     return rt;
  fail:
@@ -1712,6 +1889,16 @@ void *JS_GetRuntimeOpaque(JSRuntime *rt)
 void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
 {
     rt->user_opaque = opaque;
+}
+
+int JS_SetHostCallDispatcher(JSRuntime *rt, JSHostCallFunc *func, void *opaque)
+{
+    if (!rt)
+        return -1;
+
+    rt->host_call_func = func;
+    rt->host_call_opaque = opaque;
+    return 0;
 }
 
 /* default memory allocation functions with memory limitation */
@@ -1945,6 +2132,11 @@ static JSString *js_alloc_string_rt(JSRuntime *rt, int max_len, int is_wide_char
 static JSString *js_alloc_string(JSContext *ctx, int max_len, int is_wide_char)
 {
     JSString *p;
+    size_t alloc_size = sizeof(JSString) +
+                        (((size_t)max_len << is_wide_char) + 1 - is_wide_char);
+
+    if (js_charge_gas_allocation_ctx(ctx, alloc_size))
+        return NULL;
     p = js_alloc_string_rt(ctx->rt, max_len, is_wide_char);
     if (unlikely(!p)) {
         JS_ThrowOutOfMemory(ctx);
@@ -2187,6 +2379,9 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->iterator_ctor = JS_NULL;
     ctx->regexp_ctor = JS_NULL;
     ctx->promise_ctor = JS_NULL;
+    ctx->gas_limit = JS_GAS_UNLIMITED;
+    ctx->gas_remaining = JS_GAS_UNLIMITED;
+    ctx->gas_version = JS_GAS_VERSION_LATEST;
     init_list_head(&ctx->loaded_modules);
 
     if (JS_AddIntrinsicBasicObjects(ctx)) {
@@ -2221,6 +2416,861 @@ JSContext *JS_NewContext(JSRuntime *rt)
     return ctx;
 }
 
+enum {
+    JS_DETERMINISTIC_DISABLED_EVAL = 1,
+    JS_DETERMINISTIC_DISABLED_FUNCTION = 2,
+    JS_DETERMINISTIC_DISABLED_RANDOM = 3,
+    JS_DETERMINISTIC_DISABLED_PROMISE = 4,
+    JS_DETERMINISTIC_DISABLED_REGEXP = 5,
+    JS_DETERMINISTIC_DISABLED_PROXY = 6,
+    JS_DETERMINISTIC_DISABLED_TYPED_ARRAY = 7,
+    JS_DETERMINISTIC_DISABLED_ARRAY_BUFFER = 8,
+    JS_DETERMINISTIC_DISABLED_SHARED_ARRAY_BUFFER = 9,
+    JS_DETERMINISTIC_DISABLED_DATAVIEW = 10,
+    JS_DETERMINISTIC_DISABLED_WEBASSEMBLY = 11,
+    JS_DETERMINISTIC_DISABLED_ATOMICS = 12,
+    JS_DETERMINISTIC_DISABLED_CONSOLE = 13,
+    JS_DETERMINISTIC_DISABLED_PRINT = 14,
+    JS_DETERMINISTIC_DISABLED_JSON_PARSE = 15,
+    JS_DETERMINISTIC_DISABLED_JSON_STRINGIFY = 16,
+    JS_DETERMINISTIC_DISABLED_ARRAY_SORT = 17,
+};
+
+static const char *js_get_disabled_name(int magic)
+{
+    switch (magic) {
+    case JS_DETERMINISTIC_DISABLED_ARRAY_SORT:
+        return "Array.prototype.sort";
+    case JS_DETERMINISTIC_DISABLED_JSON_STRINGIFY:
+        return "JSON.stringify";
+    case JS_DETERMINISTIC_DISABLED_JSON_PARSE:
+        return "JSON.parse";
+    case JS_DETERMINISTIC_DISABLED_PRINT:
+        return "print";
+    case JS_DETERMINISTIC_DISABLED_CONSOLE:
+        return "console";
+    case JS_DETERMINISTIC_DISABLED_ATOMICS:
+        return "Atomics";
+    case JS_DETERMINISTIC_DISABLED_WEBASSEMBLY:
+        return "WebAssembly";
+    case JS_DETERMINISTIC_DISABLED_DATAVIEW:
+        return "DataView";
+    case JS_DETERMINISTIC_DISABLED_SHARED_ARRAY_BUFFER:
+        return "SharedArrayBuffer";
+    case JS_DETERMINISTIC_DISABLED_ARRAY_BUFFER:
+        return "ArrayBuffer";
+    case JS_DETERMINISTIC_DISABLED_TYPED_ARRAY:
+        return "Typed arrays";
+    case JS_DETERMINISTIC_DISABLED_PROXY:
+        return "Proxy";
+    case JS_DETERMINISTIC_DISABLED_REGEXP:
+        return "RegExp";
+    case JS_DETERMINISTIC_DISABLED_PROMISE:
+        return "Promise";
+    case JS_DETERMINISTIC_DISABLED_RANDOM:
+        return "Math.random";
+    case JS_DETERMINISTIC_DISABLED_FUNCTION:
+        return "Function";
+    case JS_DETERMINISTIC_DISABLED_EVAL:
+    default:
+        return "eval";
+    }
+}
+
+static JSValue js_deterministic_disabled(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv, int magic)
+{
+    const char *name = js_get_disabled_name(magic);
+    if (magic == JS_DETERMINISTIC_DISABLED_TYPED_ARRAY)
+        return JS_ThrowTypeError(ctx, "%s are disabled in deterministic mode", name);
+    return JS_ThrowTypeError(ctx, "%s is disabled in deterministic mode", name);
+}
+
+static int js_deterministic_define_disabled_global(JSContext *ctx, const char *name,
+                                                   int length, int magic)
+{
+    JSValue fn;
+    int ret;
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, name, length,
+                              JS_CFUNC_constructor_or_func_magic, magic);
+    if (JS_IsException(fn))
+        return -1;
+
+    ret = JS_DefinePropertyValueStr(ctx, ctx->global_obj, name, JS_DupValue(ctx, fn),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_FreeValue(ctx, fn);
+    if (ret < 0)
+        return -1;
+
+    return 0;
+}
+
+static JSValue js_deterministic_compile_regexp(JSContext *ctx, JSValueConst pattern,
+                                               JSValueConst flags)
+{
+    (void)pattern;
+    (void)flags;
+    return JS_ThrowTypeError(ctx, "RegExp is disabled in deterministic mode");
+}
+
+static int js_deterministic_disable_eval(JSContext *ctx)
+{
+    JSValue fn;
+    int ret;
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "eval", 1,
+                              JS_CFUNC_generic_magic, JS_DETERMINISTIC_DISABLED_EVAL);
+    if (JS_IsException(fn))
+        return -1;
+
+    ret = JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_eval, JS_DupValue(ctx, fn),
+                                 JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                     JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    if (ret < 0) {
+        JS_FreeValue(ctx, fn);
+        return -1;
+    }
+
+    JS_FreeValue(ctx, ctx->eval_obj);
+    ctx->eval_obj = JS_UNDEFINED;
+    JS_FreeValue(ctx, fn);
+    return 0;
+}
+
+static int js_deterministic_disable_function(JSContext *ctx)
+{
+    JSValue fn;
+    int ret;
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "Function", 1,
+                              JS_CFUNC_constructor_or_func_magic, JS_DETERMINISTIC_DISABLED_FUNCTION);
+    if (JS_IsException(fn))
+        return -1;
+
+    ret = JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_Function, JS_DupValue(ctx, fn),
+                                 JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                     JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_FreeValue(ctx, fn);
+    if (ret < 0)
+        return -1;
+
+    return 0;
+}
+
+static int js_deterministic_disable_random(JSContext *ctx)
+{
+    JSValue math, fn;
+    int ret;
+
+    math = JS_GetProperty(ctx, ctx->global_obj, JS_ATOM_Math);
+    if (JS_IsException(math))
+        return -1;
+    if (!JS_IsObject(math)) {
+        JS_FreeValue(ctx, math);
+        return -1;
+    }
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "random", 0,
+                              JS_CFUNC_generic_magic, JS_DETERMINISTIC_DISABLED_RANDOM);
+    if (JS_IsException(fn)) {
+        JS_FreeValue(ctx, math);
+        return -1;
+    }
+
+    ret = JS_DefinePropertyValueStr(ctx, math, "random", JS_DupValue(ctx, fn),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, math);
+    if (ret < 0)
+        return -1;
+
+    return 0;
+}
+
+static int js_deterministic_disable_regexp(JSContext *ctx)
+{
+    JSValue fn;
+    int ret;
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "RegExp", 2,
+                              JS_CFUNC_constructor_or_func_magic, JS_DETERMINISTIC_DISABLED_REGEXP);
+    if (JS_IsException(fn))
+        return -1;
+
+    ret = JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_RegExp, JS_DupValue(ctx, fn),
+                                 JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                     JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    if (ret < 0) {
+        JS_FreeValue(ctx, fn);
+        return -1;
+    }
+
+    JS_FreeValue(ctx, ctx->regexp_ctor);
+    ctx->regexp_ctor = JS_DupValue(ctx, fn);
+    ctx->compile_regexp = js_deterministic_compile_regexp;
+
+    JS_FreeValue(ctx, fn);
+    return 0;
+}
+
+static int js_deterministic_disable_proxy(JSContext *ctx)
+{
+    JSValue fn;
+    int ret;
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "Proxy", 2,
+                              JS_CFUNC_constructor_or_func_magic, JS_DETERMINISTIC_DISABLED_PROXY);
+    if (JS_IsException(fn))
+        return -1;
+
+    ret = JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_Proxy, JS_DupValue(ctx, fn),
+                                 JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                     JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_FreeValue(ctx, fn);
+    if (ret < 0)
+        return -1;
+
+    return 0;
+}
+
+static int js_deterministic_disable_promise(JSContext *ctx)
+{
+    JSValue fn;
+    int ret;
+
+    fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "Promise", 1,
+                              JS_CFUNC_constructor_or_func_magic, JS_DETERMINISTIC_DISABLED_PROMISE);
+    if (JS_IsException(fn))
+        return -1;
+
+    ret = JS_DefinePropertyValue(ctx, ctx->global_obj, JS_ATOM_Promise, JS_DupValue(ctx, fn),
+                                 JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                     JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+
+    /* Ensure async internals see the disabled ctor */
+    JS_FreeValue(ctx, ctx->promise_ctor);
+    ctx->promise_ctor = JS_DupValue(ctx, fn);
+
+    /* Mirror common Promise statics to the same disabled stub */
+    JS_DefinePropertyValueStr(ctx, fn, "resolve", JS_DupValue(ctx, fn),
+                              JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                  JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, fn, "reject", JS_DupValue(ctx, fn),
+                              JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                  JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, fn, "all", JS_DupValue(ctx, fn),
+                              JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                  JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, fn, "race", JS_DupValue(ctx, fn),
+                              JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                  JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, fn, "any", JS_DupValue(ctx, fn),
+                              JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                  JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    JS_DefinePropertyValueStr(ctx, fn, "allSettled", JS_DupValue(ctx, fn),
+                              JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                  JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+
+    JS_FreeValue(ctx, fn);
+    if (ret < 0)
+        return -1;
+
+    return 0;
+}
+
+static int js_deterministic_disable_typed_arrays(JSContext *ctx)
+{
+    static const struct {
+        const char *name;
+        int length;
+        int magic;
+    } entries[] = {
+        { "ArrayBuffer", 1, JS_DETERMINISTIC_DISABLED_ARRAY_BUFFER },
+        { "SharedArrayBuffer", 1, JS_DETERMINISTIC_DISABLED_SHARED_ARRAY_BUFFER },
+        { "DataView", 3, JS_DETERMINISTIC_DISABLED_DATAVIEW },
+        { "Uint8Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Uint8ClampedArray", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Int8Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Uint16Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Int16Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Uint32Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Int32Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "BigInt64Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "BigUint64Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Float16Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Float32Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+        { "Float64Array", 3, JS_DETERMINISTIC_DISABLED_TYPED_ARRAY },
+    };
+
+    for (size_t i = 0; i < countof(entries); i++) {
+        if (js_deterministic_define_disabled_global(ctx, entries[i].name,
+                                                    entries[i].length, entries[i].magic))
+            return -1;
+    }
+    return 0;
+}
+
+static int js_deterministic_disable_webassembly(JSContext *ctx)
+{
+    return js_deterministic_define_disabled_global(ctx, "WebAssembly", 1,
+                                                   JS_DETERMINISTIC_DISABLED_WEBASSEMBLY);
+}
+
+static int js_deterministic_disable_atomics(JSContext *ctx)
+{
+    return js_deterministic_define_disabled_global(ctx, "Atomics", 3,
+                                                   JS_DETERMINISTIC_DISABLED_ATOMICS);
+}
+
+static int js_deterministic_disable_console(JSContext *ctx)
+{
+    JSValue console;
+
+    console = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(console))
+        return -1;
+
+    static const char *const methods[] = { "log", "info", "warn", "error", "debug" };
+    for (size_t i = 0; i < countof(methods); i++) {
+        JSValue fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "console", 1,
+                                          JS_CFUNC_generic_magic, JS_DETERMINISTIC_DISABLED_CONSOLE);
+        if (JS_IsException(fn)) {
+            JS_FreeValue(ctx, console);
+            return -1;
+        }
+        if (JS_DefinePropertyValueStr(ctx, console, methods[i], JS_DupValue(ctx, fn),
+                                      JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                          JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE) < 0) {
+            JS_FreeValue(ctx, fn);
+            JS_FreeValue(ctx, console);
+            return -1;
+        }
+        JS_FreeValue(ctx, fn);
+    }
+
+    if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, "console", JS_DupValue(ctx, console),
+                                  JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                      JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE) < 0) {
+        JS_FreeValue(ctx, console);
+        return -1;
+    }
+
+    JS_FreeValue(ctx, console);
+    return 0;
+}
+
+static int js_deterministic_disable_print(JSContext *ctx)
+{
+    return js_deterministic_define_disabled_global(ctx, "print", 1,
+                                                   JS_DETERMINISTIC_DISABLED_PRINT);
+}
+
+static int js_deterministic_disable_json(JSContext *ctx)
+{
+    JSValue json, parse_fn, stringify_fn;
+    int ret;
+
+    json = JS_GetProperty(ctx, ctx->global_obj, JS_ATOM_JSON);
+    if (JS_IsException(json))
+        return -1;
+    if (!JS_IsObject(json)) {
+        JS_FreeValue(ctx, json);
+        return -1;
+    }
+
+    parse_fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "parse", 2,
+                                    JS_CFUNC_generic_magic, JS_DETERMINISTIC_DISABLED_JSON_PARSE);
+    if (JS_IsException(parse_fn)) {
+        JS_FreeValue(ctx, json);
+        return -1;
+    }
+    stringify_fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "stringify", 3,
+                                        JS_CFUNC_generic_magic, JS_DETERMINISTIC_DISABLED_JSON_STRINGIFY);
+    if (JS_IsException(stringify_fn)) {
+        JS_FreeValue(ctx, parse_fn);
+        JS_FreeValue(ctx, json);
+        return -1;
+    }
+
+    ret = JS_DefinePropertyValueStr(ctx, json, "parse", JS_DupValue(ctx, parse_fn),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    if (ret < 0)
+        goto fail;
+
+    ret = JS_DefinePropertyValueStr(ctx, json, "stringify", JS_DupValue(ctx, stringify_fn),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    if (ret < 0)
+        goto fail;
+
+    JS_FreeValue(ctx, parse_fn);
+    JS_FreeValue(ctx, stringify_fn);
+    JS_FreeValue(ctx, json);
+    return 0;
+
+fail:
+    JS_FreeValue(ctx, parse_fn);
+    JS_FreeValue(ctx, stringify_fn);
+    JS_FreeValue(ctx, json);
+    return -1;
+}
+
+static int js_deterministic_disable_array_sort(JSContext *ctx)
+{
+    JSValue array_ctor, array_proto, sort_fn;
+    int ret;
+
+    array_ctor = JS_GetProperty(ctx, ctx->global_obj, JS_ATOM_Array);
+    if (JS_IsException(array_ctor))
+        return -1;
+    if (!JS_IsObject(array_ctor)) {
+        JS_FreeValue(ctx, array_ctor);
+        return -1;
+    }
+
+    array_proto = JS_GetProperty(ctx, array_ctor, JS_ATOM_prototype);
+    if (JS_IsException(array_proto)) {
+        JS_FreeValue(ctx, array_ctor);
+        return -1;
+    }
+    JS_FreeValue(ctx, array_ctor);
+    if (!JS_IsObject(array_proto)) {
+        JS_FreeValue(ctx, array_proto);
+        return -1;
+    }
+
+    sort_fn = JS_NewCFunctionMagic(ctx, js_deterministic_disabled, "sort", 1,
+                                   JS_CFUNC_generic_magic, JS_DETERMINISTIC_DISABLED_ARRAY_SORT);
+    if (JS_IsException(sort_fn)) {
+        JS_FreeValue(ctx, array_proto);
+        return -1;
+    }
+
+    ret = JS_DefinePropertyValueStr(ctx, array_proto, "sort", JS_DupValue(ctx, sort_fn),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+
+    JS_FreeValue(ctx, sort_fn);
+    JS_FreeValue(ctx, array_proto);
+    if (ret < 0)
+        return -1;
+    return 0;
+}
+
+static int js_deterministic_init_host(JSContext *ctx)
+{
+    JSValue host_ns, host_v1;
+    int ret;
+
+    host_ns = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(host_ns))
+        return -1;
+
+    host_v1 = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(host_v1)) {
+        JS_FreeValue(ctx, host_ns);
+        return -1;
+    }
+
+    ret = JS_DefinePropertyValueStr(ctx, host_ns, "v1", JS_DupValue(ctx, host_v1),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    if (ret < 0)
+        goto fail;
+
+    ret = JS_DefinePropertyValueStr(ctx, ctx->global_obj, "Host", JS_DupValue(ctx, host_ns),
+                                    JS_PROP_HAS_VALUE | JS_PROP_HAS_CONFIGURABLE |
+                                        JS_PROP_HAS_WRITABLE | JS_PROP_HAS_ENUMERABLE);
+    if (ret < 0)
+        goto fail;
+
+    JS_FreeValue(ctx, host_ns);
+    JS_FreeValue(ctx, host_v1);
+
+    return 0;
+
+fail:
+    JS_FreeValue(ctx, host_ns);
+    JS_FreeValue(ctx, host_v1);
+    return -1;
+}
+
+static int js_deterministic_init_context(JSContext *ctx)
+{
+    if (JS_AddIntrinsicBaseObjects(ctx) ||
+        JS_AddIntrinsicEval(ctx) ||
+        JS_AddIntrinsicJSON(ctx) ||
+        JS_AddIntrinsicMapSet(ctx) ||
+        js_deterministic_disable_eval(ctx) ||
+        js_deterministic_disable_function(ctx) ||
+        js_deterministic_disable_regexp(ctx) ||
+        js_deterministic_disable_proxy(ctx) ||
+        js_deterministic_disable_random(ctx) ||
+        js_deterministic_disable_promise(ctx) ||
+        js_deterministic_disable_typed_arrays(ctx) ||
+        js_deterministic_disable_atomics(ctx) ||
+        js_deterministic_disable_console(ctx) ||
+        js_deterministic_disable_print(ctx) ||
+        js_deterministic_disable_json(ctx) ||
+        js_deterministic_disable_array_sort(ctx) ||
+        js_deterministic_disable_webassembly(ctx) ||
+        js_deterministic_init_host(ctx)) {
+        return -1;
+    }
+    ctx->random_state = 1; /* deterministic seed */
+    ctx->deterministic_mode = TRUE;
+    return 0;
+}
+
+#ifdef __EMSCRIPTEN__
+__attribute__((import_module("host"), import_name("host_call")))
+uint32_t js_wasm_import_host_call(uint32_t fn_id, uint32_t req_ptr, uint32_t req_len,
+                                  uint32_t resp_ptr, uint32_t resp_capacity);
+
+static uint32_t js_wasm_host_call(JSContext *ctx, uint32_t fn_id, const uint8_t *req_ptr,
+                                  uint32_t req_len, uint8_t *resp_ptr,
+                                  uint32_t resp_capacity, void *opaque)
+{
+    (void)ctx;
+    (void)opaque;
+    return js_wasm_import_host_call(fn_id,
+                                    (uint32_t)(uintptr_t)req_ptr,
+                                    req_len,
+                                    (uint32_t)(uintptr_t)resp_ptr,
+                                    resp_capacity);
+}
+#endif
+
+int JS_NewDeterministicRuntime(JSRuntime **out_rt, JSContext **out_ctx)
+{
+    JSRuntime *rt;
+    JSContext *ctx;
+
+    if (!out_rt || !out_ctx)
+        return -1;
+
+    *out_rt = NULL;
+    *out_ctx = NULL;
+
+    rt = JS_NewRuntime();
+    if (!rt)
+        return -1;
+
+    rt->deterministic_mode = TRUE;
+    rt->det_gc_pending = FALSE;
+    rt->det_gc_alloc_bytes = 0;
+#ifdef __EMSCRIPTEN__
+    rt->host_call_func = js_wasm_host_call;
+#else
+    rt->host_call_func = NULL;
+#endif
+    rt->host_call_opaque = NULL;
+    rt->in_host_call = FALSE;
+    JS_SetGCThreshold(rt, (size_t)-1);
+
+    ctx = JS_NewContextRaw(rt);
+    if (!ctx) {
+        JS_FreeRuntime(rt);
+        return -1;
+    }
+
+    if (js_deterministic_init_context(ctx)) {
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        return -1;
+    }
+
+    *out_rt = rt;
+    *out_ctx = ctx;
+    return 0;
+}
+
+static JSValue JS_ThrowManifestError(JSContext *ctx, const char *code, const char *message)
+{
+    JSValue obj, name, msg, code_val;
+
+    obj = JS_NewError(ctx);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+
+    name = JS_NewString(ctx, "ManifestError");
+    msg = JS_NewString(ctx, message);
+    code_val = JS_NewString(ctx, code);
+    if (JS_IsException(name) || JS_IsException(msg) || JS_IsException(code_val)) {
+        if (!JS_IsException(name))
+            JS_FreeValue(ctx, name);
+        if (!JS_IsException(msg))
+            JS_FreeValue(ctx, msg);
+        if (!JS_IsException(code_val))
+            JS_FreeValue(ctx, code_val);
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, name,
+                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, msg,
+                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx, obj, "code", code_val,
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_Throw(ctx, obj);
+    return JS_EXCEPTION;
+}
+
+static int js_hex_nibble(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+static int js_parse_hash_hex(JSContext *ctx, const char *hex, uint8_t *out, size_t out_size)
+{
+    size_t hex_len, i;
+
+    if (!hex || !out)
+        return -1;
+
+    hex_len = strlen(hex);
+    if (hex_len != out_size * 2) {
+        JS_ThrowTypeError(ctx, "abi manifest hash must be 64 lowercase hex characters");
+        return -1;
+    }
+
+    for(i = 0; i < out_size; i++) {
+        int high = js_hex_nibble(hex[i * 2]);
+        int low = js_hex_nibble(hex[i * 2 + 1]);
+        if (high < 0 || low < 0) {
+            JS_ThrowTypeError(ctx, "abi manifest hash must be 64 lowercase hex characters");
+            return -1;
+        }
+        out[i] = (uint8_t)((high << 4) | low);
+    }
+
+    return 0;
+}
+
+int JS_InitDeterministicContext(JSContext *ctx, const JSDeterministicInitOptions *options)
+{
+    uint8_t computed_hash[32];
+    uint8_t expected_hash[32];
+    uint8_t *manifest_copy = NULL;
+    uint8_t *context_copy = NULL;
+
+    if (!ctx || !options)
+        return -1;
+
+    if (ctx->abi_manifest_bytes) {
+        JS_ThrowTypeError(ctx, "abi manifest is already initialized");
+        return -1;
+    }
+
+    if (!options->manifest_bytes || options->manifest_size == 0) {
+        JS_ThrowTypeError(ctx, "abi manifest is required");
+        return -1;
+    }
+
+    if (options->manifest_size > JS_DETERMINISTIC_MAX_MANIFEST_BYTES) {
+        JS_ThrowTypeError(ctx, "abi manifest exceeds maximum size");
+        return -1;
+    }
+
+    if (!options->manifest_hash_hex) {
+        JS_ThrowTypeError(ctx, "abi manifest hash is required");
+        return -1;
+    }
+
+    if (js_parse_hash_hex(ctx, options->manifest_hash_hex, expected_hash, sizeof(expected_hash)) != 0)
+        return -1;
+
+    if (options->context_blob_size > 0 && !options->context_blob) {
+        JS_ThrowTypeError(ctx, "context blob is required when context_blob_size is set");
+        return -1;
+    }
+
+    js_sha256(options->manifest_bytes, options->manifest_size, computed_hash);
+    if (memcmp(computed_hash, expected_hash, sizeof(expected_hash)) != 0) {
+        JS_ThrowManifestError(ctx, "ABI_MANIFEST_HASH_MISMATCH", "abi manifest hash mismatch");
+        return -1;
+    }
+
+    manifest_copy = js_malloc_rt(ctx->rt, options->manifest_size);
+    if (!manifest_copy) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    memcpy(manifest_copy, options->manifest_bytes, options->manifest_size);
+
+    if (options->context_blob && options->context_blob_size > 0) {
+        if (options->context_blob_size > JS_DETERMINISTIC_MAX_CONTEXT_BLOB_BYTES) {
+            js_free_rt(ctx->rt, manifest_copy);
+            JS_ThrowTypeError(ctx, "context blob exceeds maximum size");
+            return -1;
+        }
+
+        context_copy = js_malloc_rt(ctx->rt, options->context_blob_size);
+        if (!context_copy) {
+            js_free_rt(ctx->rt, manifest_copy);
+            JS_ThrowOutOfMemory(ctx);
+            return -1;
+        }
+        memcpy(context_copy, options->context_blob, options->context_blob_size);
+    }
+
+    if (JS_InitHostFromManifest(ctx, manifest_copy, options->manifest_size) != 0) {
+        js_free_rt(ctx->rt, manifest_copy);
+        if (context_copy)
+            js_free_rt(ctx->rt, context_copy);
+        return -1;
+    }
+
+    if (context_copy && options->context_blob_size > 0) {
+        if (JS_InitErgonomicGlobals(ctx, context_copy, options->context_blob_size) != 0) {
+            JS_FreeHostManifest(ctx);
+            js_free_rt(ctx->rt, manifest_copy);
+            js_free_rt(ctx->rt, context_copy);
+            return -1;
+        }
+    }
+
+    memcpy(ctx->abi_manifest_hash, computed_hash, sizeof(computed_hash));
+    js_sha256_to_hex(computed_hash, ctx->abi_manifest_hash_hex);
+    ctx->abi_manifest_bytes = manifest_copy;
+    ctx->abi_manifest_size = options->manifest_size;
+    ctx->deterministic_context_blob = context_copy;
+    ctx->deterministic_context_blob_size = context_copy ? options->context_blob_size : 0;
+    JS_SetGasLimit(ctx, options->gas_limit);
+
+    return 0;
+}
+
+static int js_reserve_host_response_buffer(JSContext *ctx, uint32_t capacity)
+{
+    uint8_t *new_buf;
+
+    if (ctx->host_call_resp_capacity >= capacity)
+        return 0;
+
+    new_buf = js_realloc_rt(ctx->rt, ctx->host_call_resp_buf, capacity);
+    if (!new_buf) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+
+    ctx->host_call_resp_buf = new_buf;
+    ctx->host_call_resp_capacity = capacity;
+    return 0;
+}
+
+int JS_HostCall(JSContext *ctx,
+                uint32_t fn_id,
+                const uint8_t *req_bytes,
+                size_t req_len,
+                uint32_t max_request_bytes,
+                uint32_t max_response_bytes,
+                JSHostCallResult *out_result)
+{
+    JSRuntime *rt;
+    uint32_t resp_len, resp_capacity, req_len32;
+    uint32_t dv_limit;
+    const uint8_t *req_ptr;
+
+    if (!ctx || !out_result)
+        return -1;
+
+    out_result->data = NULL;
+    out_result->length = 0;
+
+    rt = ctx->rt;
+    dv_limit = JS_DV_LIMIT_DEFAULTS.max_encoded_bytes;
+
+    if (!rt->host_call_func) {
+        JS_ThrowTypeError(ctx, "host_call dispatcher is not configured");
+        return -1;
+    }
+
+    if (fn_id == 0) {
+        JS_ThrowTypeError(ctx, "host_call fn_id must be >= 1");
+        return -1;
+    }
+
+    if (max_request_bytes == 0) {
+        JS_ThrowTypeError(ctx, "host_call max_request_bytes must be > 0");
+        return -1;
+    }
+
+    if (max_request_bytes > dv_limit) {
+        JS_ThrowTypeError(ctx, "host_call max_request_bytes exceeds DV limit");
+        return -1;
+    }
+
+    if (max_response_bytes == 0) {
+        JS_ThrowTypeError(ctx, "host_call max_response_bytes must be > 0");
+        return -1;
+    }
+
+    if (max_response_bytes > dv_limit) {
+        JS_ThrowTypeError(ctx, "host_call max_response_bytes exceeds DV limit");
+        return -1;
+    }
+
+    if (req_len > (size_t)max_request_bytes) {
+        JS_ThrowTypeError(ctx, "host_call request exceeds max_request_bytes");
+        return -1;
+    }
+
+    if (req_len > (size_t)dv_limit) {
+        JS_ThrowTypeError(ctx, "host_call request exceeds DV limit");
+        return -1;
+    }
+
+    if (req_len > UINT32_MAX) {
+        JS_ThrowTypeError(ctx, "host_call request length overflow");
+        return -1;
+    }
+
+    if (req_len > 0 && !req_bytes) {
+        JS_ThrowTypeError(ctx, "host_call request pointer is null");
+        return -1;
+    }
+
+    if (rt->in_host_call) {
+        JS_ThrowTypeError(ctx, "host_call is already in progress");
+        return -1;
+    }
+
+    resp_capacity = max_response_bytes;
+    if (js_reserve_host_response_buffer(ctx, resp_capacity))
+        return -1;
+
+    rt->in_host_call = TRUE;
+    req_len32 = (uint32_t)req_len;
+    req_ptr = req_bytes ? req_bytes : NULL;
+    resp_len = rt->host_call_func(ctx, fn_id, req_ptr, req_len32,
+                                  ctx->host_call_resp_buf, resp_capacity,
+                                  rt->host_call_opaque);
+    rt->in_host_call = FALSE;
+
+    if (JS_HasException(ctx))
+        return -1;
+
+    if (resp_len == JS_HOST_CALL_TRANSPORT_ERROR || resp_len > resp_capacity) {
+        JS_ThrowHostTransportError(ctx);
+        return -1;
+    }
+
+    out_result->data = ctx->host_call_resp_buf;
+    out_result->length = resp_len;
+    return 0;
+}
+
 void *JS_GetContextOpaque(JSContext *ctx)
 {
     return ctx->user_opaque;
@@ -2229,6 +3279,148 @@ void *JS_GetContextOpaque(JSContext *ctx)
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
     ctx->user_opaque = opaque;
+}
+
+static JSValue JS_ThrowOutOfGas(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue obj, name, message, code;
+
+    if (rt->in_out_of_gas)
+        return JS_EXCEPTION;
+
+    rt->in_out_of_gas = TRUE;
+    obj = JS_NewError(ctx);
+    if (JS_IsException(obj))
+        goto fail;
+
+    name = JS_NewString(ctx, "OutOfGas");
+    message = JS_NewString(ctx, "out of gas");
+    code = JS_NewString(ctx, "OOG");
+    if (JS_IsException(name) || JS_IsException(message) || JS_IsException(code)) {
+        if (!JS_IsException(name))
+            JS_FreeValue(ctx, name);
+        if (!JS_IsException(message))
+            JS_FreeValue(ctx, message);
+        if (!JS_IsException(code))
+            JS_FreeValue(ctx, code);
+        JS_FreeValue(ctx, obj);
+        goto fail;
+    }
+
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, name,
+                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValue(ctx, obj, JS_ATOM_message, message,
+                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx, obj, "code", code,
+                              JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_Throw(ctx, obj);
+    JS_SetUncatchableException(ctx, TRUE);
+    rt->in_out_of_gas = FALSE;
+    return JS_EXCEPTION;
+
+fail:
+    rt->in_out_of_gas = FALSE;
+    return JS_EXCEPTION;
+}
+
+void JS_SetGasLimit(JSContext *ctx, uint64_t gas_limit)
+{
+    ctx->gas_limit = gas_limit;
+    ctx->gas_remaining = gas_limit;
+}
+
+uint64_t JS_GetGasRemaining(JSContext *ctx)
+{
+    return ctx->gas_remaining;
+}
+
+uint64_t JS_GetGasLimit(JSContext *ctx)
+{
+    return ctx->gas_limit;
+}
+
+uint32_t JS_GetGasVersion(JSContext *ctx)
+{
+    return ctx->gas_version;
+}
+
+int JS_EnableGasTrace(JSContext *ctx, int enabled)
+{
+    JSGasTraceData *trace;
+
+    if (!ctx)
+        return -1;
+
+    trace = js_gas_trace_ensure(ctx);
+    if (!trace)
+        return -1;
+
+    js_gas_trace_reset_counts(trace);
+    trace->enabled = enabled ? TRUE : FALSE;
+    return 0;
+}
+
+int JS_ResetGasTrace(JSContext *ctx)
+{
+    JSGasTraceData *trace = js_gas_trace_or_null(ctx);
+
+    if (!trace)
+        return -1;
+
+    js_gas_trace_reset_counts(trace);
+    return 0;
+}
+
+int JS_ReadGasTrace(JSContext *ctx, JSGasTrace *out_trace)
+{
+    JSGasTraceData *trace = js_gas_trace_or_null(ctx);
+
+    if (!trace || !out_trace)
+        return -1;
+
+    out_trace->opcode_count = trace->opcode_count_total;
+    out_trace->opcode_gas = trace->opcode_gas;
+    out_trace->builtin_array_cb_base_count = trace->builtin_array_cb_base_count;
+    out_trace->builtin_array_cb_base_gas = trace->builtin_array_cb_base_gas;
+    out_trace->builtin_array_cb_per_element_count = trace->builtin_array_cb_per_element_count;
+    out_trace->builtin_array_cb_per_element_gas = trace->builtin_array_cb_per_element_gas;
+    out_trace->allocation_count = trace->allocation_count;
+    out_trace->allocation_bytes = trace->allocation_bytes;
+    out_trace->allocation_gas = trace->allocation_gas;
+
+    return 0;
+}
+
+int JS_UseGas(JSContext *ctx, uint64_t amount)
+{
+    if (ctx->gas_limit == JS_GAS_UNLIMITED)
+        return 0;
+    if (amount == 0)
+        return 0;
+    if (amount > ctx->gas_remaining) {
+        ctx->gas_remaining = 0;
+        JS_ThrowOutOfGas(ctx);
+        return -1;
+    }
+    ctx->gas_remaining -= amount;
+    return 0;
+}
+
+int JS_RunGCCheckpoint(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+
+    if (rt->current_exception_is_uncatchable || rt->in_out_of_gas)
+        return 0;
+
+    if (rt->deterministic_mode && !rt->det_gc_pending)
+        return 0;
+
+    JS_RunGC(rt);
+    rt->det_gc_pending = FALSE;
+    rt->det_gc_alloc_bytes = 0;
+    return 0;
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -2370,6 +3562,7 @@ void JS_FreeContext(JSContext *ctx)
     }
 #endif
 
+    JS_FreeHostManifest(ctx);
     js_free_modules(ctx, JS_FREE_MODULE_ALL);
 
     JS_FreeValue(ctx, ctx->global_obj);
@@ -2400,8 +3593,17 @@ void JS_FreeContext(JSContext *ctx)
     js_free_shape_null(ctx->rt, ctx->regexp_shape);
     js_free_shape_null(ctx->rt, ctx->regexp_result_shape);
 
+    if (ctx->abi_manifest_bytes)
+        js_free_rt(ctx->rt, ctx->abi_manifest_bytes);
+    if (ctx->deterministic_context_blob)
+        js_free_rt(ctx->rt, ctx->deterministic_context_blob);
+    if (ctx->host_call_resp_buf)
+        js_free_rt(ctx->rt, ctx->host_call_resp_buf);
+
     list_del(&ctx->link);
     remove_gc_object(&ctx->header);
+    if (ctx->gas_trace)
+        js_free_rt(ctx->rt, ctx->gas_trace);
     js_free_rt(ctx->rt, ctx);
 }
 
@@ -17369,7 +18571,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     size_t alloca_size;
 
 #if !DIRECT_DISPATCH
-#define SWITCH(pc)      switch (opcode = *pc++)
+#define DISPATCH()      switch (opcode)
 #define CASE(op)        case op
 #define DEFAULT         default
 #define BREAK           break
@@ -17384,10 +18586,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #include "quickjs-opcode.h"
         [ OP_COUNT ... 255 ] = &&case_default
     };
-#define SWITCH(pc)      goto *dispatch_table[opcode = *pc++];
+#define DISPATCH()      goto *dispatch_table[opcode]
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
-#define BREAK           SWITCH(pc)
+#define BREAK           goto dispatch_next
 #endif
 
     if (js_poll_interrupts(caller_ctx))
@@ -17480,8 +18682,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     for(;;) {
         int call_argc;
         JSValue *call_argv;
+        opcode = *pc++;
+        uint16_t gas_cost = js_get_opcode_gas_cost(opcode);
+        if (unlikely(JS_UseGas(ctx, gas_cost) != 0))
+            goto exception;
+        js_gas_trace_record_opcode(ctx, opcode, gas_cost);
 
-        SWITCH(pc) {
+    #if !DIRECT_DISPATCH
+        DISPATCH() {
+    #else
+        DISPATCH();
+    #endif
         CASE(OP_push_i32):
             *sp++ = JS_NewInt32(ctx, get_u32(pc));
             pc += 4;
@@ -20061,7 +21272,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
                                   (int)(pc - b->byte_code_buf - 1), opcode);
             goto exception;
+#if !DIRECT_DISPATCH
         }
+#endif
+#if DIRECT_DISPATCH
+    dispatch_next:
+        ;
+#endif
     }
  exception:
     if (is_backtrace_needed(ctx, rt->current_exception)) {
@@ -40435,6 +41652,10 @@ static JSValue js_function_proto(JSContext *ctx, JSValueConst this_val,
 static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
                                        int argc, JSValueConst *argv, int magic)
 {
+    if (unlikely(ctx->deterministic_mode)) {
+        return JS_ThrowTypeError(ctx, "Function constructor is disabled in deterministic mode");
+    }
+
     JSFunctionKindEnum func_kind = magic;
     int i, n, ret;
     JSValue s, proto, obj = JS_UNDEFINED;
@@ -41477,6 +42698,9 @@ exception:
 #define special_filter   4
 #define special_TA       8
 
+#define JS_GAS_ARRAY_CB_BASE 5
+#define JS_GAS_ARRAY_CB_PER_ELEMENT 2
+
 static JSValue js_typed_array___speciesCreate(JSContext *ctx,
                                               JSValueConst this_val,
                                               int argc, JSValueConst *argv);
@@ -41490,8 +42714,12 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
     int64_t len, k, n;
     int present;
 
+    obj = JS_UNDEFINED;
     ret = JS_UNDEFINED;
     val = JS_UNDEFINED;
+    if (unlikely(JS_UseGas(ctx, JS_GAS_ARRAY_CB_BASE) != 0))
+        goto exception;
+    js_gas_trace_record_array_cb(ctx, JS_GAS_ARRAY_CB_BASE, FALSE);
     if (special & special_TA) {
         obj = JS_DupValue(ctx, this_val);
         len = js_typed_array_get_length_unsafe(ctx, obj);
@@ -41546,6 +42774,9 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
     n = 0;
 
     for(k = 0; k < len; k++) {
+        if (unlikely(JS_UseGas(ctx, JS_GAS_ARRAY_CB_PER_ELEMENT) != 0))
+            goto exception;
+        js_gas_trace_record_array_cb(ctx, JS_GAS_ARRAY_CB_PER_ELEMENT, TRUE);
         if (special & special_TA) {
             val = JS_GetPropertyInt64(ctx, obj, k);
             if (JS_IsException(val))
@@ -41647,8 +42878,12 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
     int64_t len, k, k1;
     int present;
 
+    obj = JS_UNDEFINED;
     acc = JS_UNDEFINED;
     val = JS_UNDEFINED;
+    if (unlikely(JS_UseGas(ctx, JS_GAS_ARRAY_CB_BASE) != 0))
+        goto exception;
+    js_gas_trace_record_array_cb(ctx, JS_GAS_ARRAY_CB_BASE, FALSE);
     if (special & special_TA) {
         obj = JS_DupValue(ctx, this_val);
         len = js_typed_array_get_length_unsafe(ctx, obj);
@@ -41669,6 +42904,9 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
         acc = JS_DupValue(ctx, argv[1]);
     } else {
         for(;;) {
+            if (unlikely(JS_UseGas(ctx, JS_GAS_ARRAY_CB_PER_ELEMENT) != 0))
+                goto exception;
+            js_gas_trace_record_array_cb(ctx, JS_GAS_ARRAY_CB_PER_ELEMENT, TRUE);
             if (k >= len) {
                 JS_ThrowTypeError(ctx, "empty array");
                 goto exception;
@@ -41691,6 +42929,9 @@ static JSValue js_array_reduce(JSContext *ctx, JSValueConst this_val,
     }
     for (; k < len; k++) {
         k1 = (special & special_reduceRight) ? len - k - 1 : k;
+        if (unlikely(JS_UseGas(ctx, JS_GAS_ARRAY_CB_PER_ELEMENT) != 0))
+            goto exception;
+        js_gas_trace_record_array_cb(ctx, JS_GAS_ARRAY_CB_PER_ELEMENT, TRUE);
         if (special & special_TA) {
             val = JS_GetPropertyInt64(ctx, obj, k1);
             if (JS_IsException(val))
